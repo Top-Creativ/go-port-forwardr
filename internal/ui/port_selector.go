@@ -196,7 +196,7 @@ func (m PortSelectorModel) View() string {
 		}
 	}
 
-	help := " ↑↓:navigate  space:toggle  a:add  d:delete  enter:start tunnels  esc:back"
+	help := " ↑↓:navigate  space:toggle  t:toggle all  a:add  d:delete  enter:start tunnels  esc:back"
 	if m.addMode {
 		help = " tab:next field  ctrl+s:save port  esc:cancel"
 	}
@@ -250,6 +250,22 @@ func (m *PortSelectorModel) ToggleCurrent() {
 	}
 	id := m.ports[m.cursor].ID
 	m.checked[id] = !m.checked[id]
+}
+
+func (m *PortSelectorModel) ToggleAll() {
+	if len(m.ports) == 0 {
+		return
+	}
+	allChecked := true
+	for _, p := range m.ports {
+		if !m.checked[p.ID] {
+			allChecked = false
+			break
+		}
+	}
+	for _, p := range m.ports {
+		m.checked[p.ID] = !allChecked
+	}
 }
 
 func (m *PortSelectorModel) MoveUp() {

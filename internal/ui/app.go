@@ -250,6 +250,8 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			ps.MoveDown()
 		case " ":
 			ps.ToggleCurrent()
+		case "t":
+			ps.ToggleAll()
 		case "a":
 			ps.EnterAddMode()
 		case "d":
@@ -257,7 +259,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			selected := ps.SelectedPorts()
 			if len(selected) == 0 {
-				m.portSelector.err = "Select at least one port first (space to toggle)"
+				m.portSelector.err = "Select at least one port first (space to toggle, t to toggle all)"
 				return m, nil
 			}
 			m.tunnelManager = tunnel.NewManager()
