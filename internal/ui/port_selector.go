@@ -17,6 +17,7 @@ type PortSelectorModel struct {
 	cursor   int
 	addMode  bool
 	delMode  bool
+	editID   int64
 	addForm  portAddForm
 	err      string
 	width    int
@@ -40,7 +41,7 @@ const (
 	pfCount
 )
 
-func newPortAddForm() portAddForm {
+func newPortForm(existing *db.Port) portAddForm {
 	mkInput := func(ph string, limit int) textinput.Model {
 		t := textinput.New()
 		t.Placeholder = ph
@@ -53,6 +54,12 @@ func newPortAddForm() portAddForm {
 		mkInput("5432", 5),
 		mkInput("localhost", 128),
 		mkInput("5432", 5),
+	}
+	if existing != nil {
+		inputs[0].SetValue(existing.Label)
+		inputs[1].SetValue(strconv.Itoa(existing.LocalPort))
+		inputs[2].SetValue(existing.RemoteHost)
+		inputs[3].SetValue(strconv.Itoa(existing.RemotePort))
 	}
 	inputs[0].Focus()
 	return portAddForm{inputs: inputs}
@@ -196,7 +203,7 @@ func (m PortSelectorModel) View() string {
 		}
 	}
 
-	help := " ↑↓:navigate  space:toggle  t:toggle all  a:add  d:delete  enter:start tunnels  esc:back"
+	help := " ↑↓:navigate  space:toggle  t:toggle all  a:add  e:edit  d:delete  enter:start tunnels  esc:back"
 	if m.addMode {
 		help = " tab:next field  ctrl+s:save port  esc:cancel"
 	}
@@ -212,7 +219,11 @@ func (m PortSelectorModel) View() string {
 
 func (m PortSelectorModel) renderAddForm() string {
 	var b strings.Builder
-	b.WriteString(StyleLabel.Render("Add New Port Rule") + "\n\n")
+	title := "Add New Port Rule"
+	if m.editID != 0 {
+		title = "Edit Port Rule"
+	}
+	b.WriteString(StyleLabel.Render(title) + "\n\n")
 
 	fields := []struct {
 		label string
@@ -282,11 +293,23 @@ func (m *PortSelectorModel) MoveDown() {
 
 func (m *PortSelectorModel) EnterAddMode() {
 	m.addMode = true
-	m.addForm = newPortAddForm()
+	m.editID = 0
+	m.addForm = newPortForm(nil)
+}
+
+func (m *PortSelectorModel) EnterEditMode() {
+	p := m.CurrentPort()
+	if p == nil {
+		return
+	}
+	m.addMode = true
+	m.editID = p.ID
+	m.addForm = newPortForm(p)
 }
 
 func (m *PortSelectorModel) ExitAddMode() {
 	m.addMode = false
+	m.editID = 0
 	m.err = ""
 }
 
@@ -296,6 +319,7 @@ func (m *PortSelectorModel) SetDelMode(on bool) {
 
 func (m *PortSelectorModel) IsAddMode() bool { return m.addMode }
 func (m *PortSelectorModel) IsDelMode() bool { return m.delMode }
+func (m PortSelectorModel) EditID() int64   { return m.editID }
 
 func (m PortSelectorModel) AddFormValidate() (db.Port, error) { return m.addForm.Validate() }
 

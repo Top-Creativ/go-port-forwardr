@@ -208,9 +208,16 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				p.ServerID = m.activeServer.ID
+				p.ID = ps.EditID()
 				return m, func() tea.Msg {
-					if err := db.CreatePort(&p); err != nil {
-						return errMsg{err}
+					if p.ID == 0 {
+						if err := db.CreatePort(&p); err != nil {
+							return errMsg{err}
+						}
+					} else {
+						if err := db.UpdatePort(&p); err != nil {
+							return errMsg{err}
+						}
 					}
 					return PortAddedMsg{}
 				}
@@ -254,6 +261,8 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			ps.ToggleAll()
 		case "a":
 			ps.EnterAddMode()
+		case "e":
+			ps.EnterEditMode()
 		case "d":
 			ps.SetDelMode(true)
 		case "enter":
