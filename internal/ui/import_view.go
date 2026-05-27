@@ -14,6 +14,7 @@ type importState int
 
 const (
 	importPath importState = iota
+	importPassword
 	importPreview
 )
 
@@ -24,13 +25,15 @@ type importServerItem struct {
 }
 
 type ImportViewModel struct {
-	state      importState
-	pathInput  textinput.Model
-	servers    []importServerItem
-	cursor     int
-	err        string
-	result     string
-	loading    bool
+	state       importState
+	pathInput   textinput.Model
+	passInput   textinput.Model
+	servers     []importServerItem
+	cursor      int
+	err         string
+	result      string
+	loading     bool
+	importData  *export.ExportData
 }
 
 type ImportDoneMsg struct{}
@@ -54,7 +57,6 @@ func (m ImportViewModel) Init() tea.Cmd {
 func (m ImportViewModel) Update(msg tea.Msg) (ImportViewModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// no-op
 
 	case errMsg:
 		m.err = msg.err.Error()
@@ -68,6 +70,12 @@ func (m ImportViewModel) Update(msg tea.Msg) (ImportViewModel, tea.Cmd) {
 	if m.state == importPath {
 		var cmd tea.Cmd
 		m.pathInput, cmd = m.pathInput.Update(msg)
+		return m, cmd
+	}
+
+	if m.state == importPassword {
+		var cmd tea.Cmd
+		m.passInput, cmd = m.passInput.Update(msg)
 		return m, cmd
 	}
 
@@ -95,6 +103,27 @@ func (m ImportViewModel) View() string {
 		}
 
 		b.WriteString(StyleHelp.Render(" enter/ctrl+s:load file  esc:cancel"))
+		return b.String()
+	}
+
+	if m.state == importPassword {
+		b.WriteString(StyleTitle.Render("  Import — Master Password"))
+		b.WriteString("\n")
+		b.WriteString(StyleSubtitle.Render(" This file is encrypted. Enter the master password to decrypt credentials."))
+		b.WriteString("\n\n")
+
+		style := StyleFieldActive
+		b.WriteString(fmt.Sprintf("  %s\n  %s\n\n", StyleLabel.Render("Password"), style.Render(m.passInput.View())))
+
+		if m.err != "" {
+			b.WriteString("\n  " + StyleError.Render("✗ "+m.err) + "\n")
+		}
+
+		if m.loading {
+			b.WriteString("\n  " + StyleMuted.Render("Decrypting...") + "\n")
+		}
+
+		b.WriteString(StyleHelp.Render(" enter/ctrl+s:decrypt  esc:cancel"))
 		return b.String()
 	}
 
@@ -165,6 +194,10 @@ func (m ImportViewModel) FilePath() string {
 	return strings.TrimSpace(m.pathInput.Value())
 }
 
+func (m ImportViewModel) Password() string {
+	return m.passInput.Value()
+}
+
 func (m *ImportViewModel) SetServers(items []importServerItem) {
 	m.servers = items
 }
@@ -208,28 +241,52 @@ func LoadImportFile(path string) tea.Cmd {
 			return errMsg{fmt.Errorf("no servers found in export file")}
 		}
 
-		items := make([]importServerItem, len(data.Servers))
-		for i, s := range data.Servers {
-			existing, err := db.FindServerByName(s.Name)
-			conflict := err == nil && existing != nil
-			name := s.Name
-			if conflict {
-				name = fmt.Sprintf("%s (imported)", s.Name)
-				items[i].server = s
-				items[i].server.Name = name
-			} else {
-				items[i].server = s
-			}
-			items[i].checked = true
-			items[i].conflict = conflict
+		if data.Encrypted {
+			return importNeedsPassword{data: data}
 		}
 
-		return importPreviewReady{items: items}
+		return importReady{data: data}
 	}
 }
 
-type importPreviewReady struct {
-	items []importServerItem
+type importNeedsPassword struct {
+	data *export.ExportData
+}
+
+type importReady struct {
+	data *export.ExportData
+}
+
+type importPasswordAccepted struct {
+	data *export.ExportData
+}
+
+func DecryptImportFile(data *export.ExportData, password string) tea.Cmd {
+	return func() tea.Msg {
+		if err := data.DecryptCredentials(password); err != nil {
+			return errMsg{err}
+		}
+		return importPasswordAccepted{data: data}
+	}
+}
+
+func BuildImportPreview(data *export.ExportData) []importServerItem {
+	items := make([]importServerItem, len(data.Servers))
+	for i, s := range data.Servers {
+		existing, err := db.FindServerByName(s.Name)
+		conflict := err == nil && existing != nil
+		name := s.Name
+		if conflict {
+			name = fmt.Sprintf("%s (imported)", s.Name)
+			items[i].server = s
+			items[i].server.Name = name
+		} else {
+			items[i].server = s
+		}
+		items[i].checked = true
+		items[i].conflict = conflict
+	}
+	return items
 }
 
 func DoImport(servers []export.ExportServer) tea.Cmd {

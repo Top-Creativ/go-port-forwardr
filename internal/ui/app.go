@@ -1,10 +1,9 @@
 package ui
 
 import (
-	"fmt"
-
 	"github.com/adzin/port-forward-cli/internal/db"
 	"github.com/adzin/port-forward-cli/internal/tunnel"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -91,15 +90,45 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.exportSelect, cmd = m.exportSelect.Update(msg)
 		return m, cmd
 
+	case exportPasswordAccepted:
+		var cmd tea.Cmd
+		m.exportSelect, cmd = m.exportSelect.Update(msg)
+		return m, cmd
+
 	case ImportDoneMsg:
 		var cmd tea.Cmd
 		m.importView, cmd = m.importView.Update(msg)
 		return m, cmd
 
-	case importPreviewReady:
-		m.importView.SetServers(msg.items)
+	case importNeedsPassword:
+		m.importView.importData = msg.data
+		m.importView.state = importPassword
+		m.importView.err = ""
+		m.importView.loading = false
+		pi := textinput.New()
+		pi.Placeholder = "Enter master password"
+		pi.EchoMode = textinput.EchoPassword
+		pi.EchoCharacter = '*'
+		pi.CharLimit = 128
+		pi.Width = 40
+		pi.Focus()
+		m.importView.passInput = pi
+		return m, textinput.Blink
+
+	case importReady:
+		m.importView.SetServers(BuildImportPreview(msg.data))
 		m.importView.state = importPreview
 		m.importView.cursor = 0
+		m.importView.loading = false
+		m.importView.err = ""
+		return m, nil
+
+	case importPasswordAccepted:
+		m.importView.SetServers(BuildImportPreview(msg.data))
+		m.importView.state = importPreview
+		m.importView.cursor = 0
+		m.importView.loading = false
+		m.importView.err = ""
 		return m, nil
 
 	case errMsg:
@@ -322,6 +351,52 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case screenExport:
+		if m.exportSelect.state == exportPassword {
+			switch key {
+			case "esc":
+				m.exportSelect.state = exportSelect
+				m.exportSelect.err = ""
+				return m, nil
+			case "tab", "down":
+				if m.exportSelect.passFocused == 0 {
+					m.exportSelect.password1.Blur()
+					m.exportSelect.passFocused = 1
+					m.exportSelect.password2.Focus()
+				} else {
+					m.exportSelect.password2.Blur()
+					m.exportSelect.passFocused = 0
+					m.exportSelect.password1.Focus()
+				}
+				return m, nil
+			case "shift+tab", "up":
+				if m.exportSelect.passFocused == 1 {
+					m.exportSelect.password2.Blur()
+					m.exportSelect.passFocused = 0
+					m.exportSelect.password1.Focus()
+				} else {
+					m.exportSelect.password1.Blur()
+					m.exportSelect.passFocused = 1
+					m.exportSelect.password2.Focus()
+				}
+				return m, nil
+			case "ctrl+s":
+				p1, p2 := m.exportSelect.Password()
+				if p1 != p2 {
+					m.exportSelect.err = "Passwords do not match"
+					return m, nil
+				}
+				m.exportSelect.selectedIDs = m.exportSelect.SelectedServerIDs()
+				m.exportSelect.err = ""
+				return m, func() tea.Msg {
+					return exportPasswordAccepted{password: p1}
+				}
+			default:
+				var cmd tea.Cmd
+				m.exportSelect, cmd = m.exportSelect.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch key {
 		case "esc":
 			m.screen = screenServerList
@@ -340,10 +415,14 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.exportSelect.err = "Select at least one server to export"
 				return m, nil
 			}
-			m.exportSelect.exporting = true
+			m.exportSelect.selectedIDs = ids
+			m.exportSelect.state = exportPassword
 			m.exportSelect.err = ""
-			m.exportSelect.result = ""
-			return m, DoExport(ids)
+			m.exportSelect.passFocused = 0
+			p1, p2 := newExportPasswordInputs()
+			m.exportSelect.password1 = p1
+			m.exportSelect.password2 = p2
+			return m, textinput.Blink
 		}
 
 	case screenImport:
@@ -356,12 +435,32 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				path := m.importView.FilePath()
 				if path == "" {
 					m.importView.err = "Please enter a file path"
-					m.importView.Update(errMsg{fmt.Errorf("no path")})
 					return m, nil
 				}
 				m.importView.loading = true
 				m.importView.err = ""
 				return m, LoadImportFile(path)
+			default:
+				var cmd tea.Cmd
+				m.importView, cmd = m.importView.Update(msg)
+				return m, cmd
+			}
+		}
+
+		if m.importView.state == importPassword {
+			switch key {
+			case "esc":
+				m.screen = screenServerList
+				return m, loadServers
+			case "enter", "ctrl+s":
+				pw := m.importView.Password()
+				if pw == "" {
+					m.importView.err = "Password is required to decrypt this file"
+					return m, nil
+				}
+				m.importView.loading = true
+				m.importView.err = ""
+				return m, DecryptImportFile(m.importView.importData, pw)
 			default:
 				var cmd tea.Cmd
 				m.importView, cmd = m.importView.Update(msg)
