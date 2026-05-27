@@ -53,3 +53,25 @@ func DeletePort(id int64) error {
 	_, err := DB.Exec(`DELETE FROM ports WHERE id=?`, id)
 	return err
 }
+
+func BulkCreatePorts(ports []Port) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for i := range ports {
+		res, err := tx.Exec(
+			`INSERT INTO ports (server_id, label, local_port, remote_host, remote_port) VALUES (?,?,?,?,?)`,
+			ports[i].ServerID, ports[i].Label, ports[i].LocalPort, ports[i].RemoteHost, ports[i].RemotePort,
+		)
+		if err != nil {
+			return err
+		}
+		ports[i].ID, _ = res.LastInsertId()
+	}
+	return tx.Commit()
+}

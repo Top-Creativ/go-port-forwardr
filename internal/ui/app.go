@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+
 	"github.com/adzin/port-forward-cli/internal/db"
 	"github.com/adzin/port-forward-cli/internal/tunnel"
 	tea "github.com/charmbracelet/bubbletea"
@@ -14,6 +16,8 @@ const (
 	screenServerForm
 	screenPortSelector
 	screenSession
+	screenExport
+	screenImport
 )
 
 type errMsg struct{ err error }
@@ -24,11 +28,13 @@ type AppModel struct {
 	serverForm    ServerFormModel
 	portSelector  PortSelectorModel
 	sessionView   SessionViewModel
+	exportSelect  ExportSelectModel
+	importView    ImportViewModel
 	tunnelManager *tunnel.Manager
 	activeServer  *db.Server
 	width         int
 	height        int
-	editMode      bool // distinguish new vs edit in form
+	editMode      bool
 }
 
 func NewApp() AppModel {
@@ -52,9 +58,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
-	// Propagate data messages to active screen
 	case ServersLoadedMsg:
-		// If we were in the form, go back to list
 		if m.screen == screenServerForm {
 			m.screen = screenServerList
 		}
@@ -82,10 +86,33 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionView, cmd = m.sessionView.Update(msg)
 		return m, cmd
 
+	case ExportDoneMsg:
+		var cmd tea.Cmd
+		m.exportSelect, cmd = m.exportSelect.Update(msg)
+		return m, cmd
+
+	case ImportDoneMsg:
+		var cmd tea.Cmd
+		m.importView, cmd = m.importView.Update(msg)
+		return m, cmd
+
+	case importPreviewReady:
+		m.importView.SetServers(msg.items)
+		m.importView.state = importPreview
+		m.importView.cursor = 0
+		return m, nil
+
 	case errMsg:
-		// Surface error in current view
 		if m.screen == screenServerForm {
 			m.serverForm.SetError(msg.err.Error())
+		} else if m.screen == screenExport {
+			var cmd tea.Cmd
+			m.exportSelect, cmd = m.exportSelect.Update(msg)
+			return m, cmd
+		} else if m.screen == screenImport {
+			var cmd tea.Cmd
+			m.importView, cmd = m.importView.Update(msg)
+			return m, cmd
 		}
 		return m, nil
 	}
@@ -96,7 +123,6 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global quit
 	if key == "ctrl+c" {
 		if m.screen == screenSession {
 			m.tunnelManager.StopAll()
@@ -107,9 +133,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.screen {
-	//─────────────────────────────────────────────
 	case screenServerList:
-		// When del-mode is active, handle confirmation keys exclusively
 		if m.serverList.delMode {
 			switch key {
 			case "y":
@@ -123,7 +147,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.serverList.SetDelMode(false)
-			default: // 'n', esc, anything else — cancel
+			default:
 				m.serverList.SetDelMode(false)
 			}
 			return m, nil
@@ -148,6 +172,17 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			m.serverList.SetDelMode(true)
+		case "x":
+			if len(m.serverList.servers) == 0 {
+				return m, nil
+			}
+			m.exportSelect = NewExportSelect(m.serverList.servers)
+			m.screen = screenExport
+			return m, nil
+		case "i":
+			m.importView = NewImportModel()
+			m.screen = screenImport
+			return m, m.importView.Init()
 		case "enter":
 			if s := m.serverList.SelectedServer(); s != nil {
 				m.activeServer = s
@@ -157,12 +192,10 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Propagate to server list (handles ServerDeletedMsg etc.)
 		var cmd tea.Cmd
 		m.serverList, cmd = m.serverList.Update(msg)
 		return m, cmd
 
-	//─────────────────────────────────────────────
 	case screenServerForm:
 		switch key {
 		case "esc":
@@ -184,7 +217,7 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						return errMsg{err}
 					}
 				}
-				return loadServers() // triggers reload & screen switch
+				return loadServers()
 			}
 		default:
 			var cmd tea.Cmd
@@ -192,7 +225,6 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-	//─────────────────────────────────────────────
 	case screenPortSelector:
 		ps := &m.portSelector
 
@@ -278,7 +310,6 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.sessionView.Init()
 		}
 
-	//─────────────────────────────────────────────
 	case screenSession:
 		switch key {
 		case "q":
@@ -289,6 +320,76 @@ func (m AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.sessionView, cmd = m.sessionView.Update(msg)
 		return m, cmd
+
+	case screenExport:
+		switch key {
+		case "esc":
+			m.screen = screenServerList
+			return m, loadServers
+		case "up", "k":
+			m.exportSelect.MoveUp()
+		case "down", "j":
+			m.exportSelect.MoveDown()
+		case " ":
+			m.exportSelect.ToggleCurrent()
+		case "t":
+			m.exportSelect.ToggleAll()
+		case "ctrl+s":
+			ids := m.exportSelect.SelectedServerIDs()
+			if len(ids) == 0 {
+				m.exportSelect.err = "Select at least one server to export"
+				return m, nil
+			}
+			m.exportSelect.exporting = true
+			m.exportSelect.err = ""
+			m.exportSelect.result = ""
+			return m, DoExport(ids)
+		}
+
+	case screenImport:
+		if m.importView.state == importPath {
+			switch key {
+			case "esc":
+				m.screen = screenServerList
+				return m, loadServers
+			case "enter", "ctrl+s":
+				path := m.importView.FilePath()
+				if path == "" {
+					m.importView.err = "Please enter a file path"
+					m.importView.Update(errMsg{fmt.Errorf("no path")})
+					return m, nil
+				}
+				m.importView.loading = true
+				m.importView.err = ""
+				return m, LoadImportFile(path)
+			default:
+				var cmd tea.Cmd
+				m.importView, cmd = m.importView.Update(msg)
+				return m, cmd
+			}
+		}
+
+		switch key {
+		case "esc":
+			m.screen = screenServerList
+			return m, loadServers
+		case "up", "k":
+			m.importView.MoveUp()
+		case "down", "j":
+			m.importView.MoveDown()
+		case " ":
+			m.importView.ToggleCurrent()
+		case "ctrl+s":
+			selected := m.importView.SelectedServers()
+			if len(selected) == 0 {
+				m.importView.err = "Select at least one server to import"
+				return m, nil
+			}
+			m.importView.loading = true
+			m.importView.err = ""
+			m.importView.result = ""
+			return m, DoImport(selected)
+		}
 	}
 
 	return m, nil
@@ -300,7 +401,6 @@ func (m AppModel) View() string {
 		w = 100
 	}
 
-	// Top banner
 	banner := StyleBanner.Render("⚡  port-forward")
 	content := m.activeContent()
 
@@ -320,6 +420,10 @@ func (m AppModel) activeContent() string {
 		return m.portSelector.View()
 	case screenSession:
 		return m.sessionView.View()
+	case screenExport:
+		return m.exportSelect.View()
+	case screenImport:
+		return m.importView.View()
 	}
 	return ""
 }

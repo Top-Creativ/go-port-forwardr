@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/adzin/port-forward-cli/internal/db"
 	"golang.org/x/crypto/ssh"
@@ -18,6 +19,12 @@ const (
 	StatusActive     Status = "active"
 	StatusError      Status = "error"
 	StatusStopped    Status = "stopped"
+)
+
+const (
+	keepaliveInterval = 30 * time.Second
+	reconnectDelay    = 5 * time.Second
+	dialTimeout       = 15 * time.Second
 )
 
 type TunnelInfo struct {
@@ -97,45 +104,106 @@ func (m *Manager) List() []TunnelInfo {
 	return out
 }
 
+// runTunnel runs a persistent tunnel with automatic reconnection.
+// It loops forever until ti.cancel is closed.
 func (m *Manager) runTunnel(server *db.Server, ti *TunnelInfo) {
-	client, err := dialSSH(server)
-	if err != nil {
-		m.setStatus(ti, StatusError, err.Error())
-		return
-	}
-	defer client.Close()
-
-	addr := fmt.Sprintf("127.0.0.1:%d", ti.Port.LocalPort)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		m.setStatus(ti, StatusError, fmt.Sprintf("listen %s: %v", addr, err))
-		return
-	}
-
-	m.mu.Lock()
-	ti.listener = ln
-	m.mu.Unlock()
-
-	m.setStatus(ti, StatusActive, "")
-
-	go func() {
-		<-ti.cancel
-		ln.Close()
-		client.Close()
-	}()
-
 	for {
-		local, err := ln.Accept()
+		// Check for cancellation before each attempt.
+		select {
+		case <-ti.cancel:
+			m.setStatus(ti, StatusStopped, "")
+			return
+		default:
+		}
+
+		m.setStatus(ti, StatusConnecting, "")
+
+		client, err := dialSSH(server)
 		if err != nil {
+			m.setStatus(ti, StatusError, err.Error())
 			select {
 			case <-ti.cancel:
 				m.setStatus(ti, StatusStopped, "")
-			default:
-				m.setStatus(ti, StatusError, err.Error())
+				return
+			case <-time.After(reconnectDelay):
+				continue
 			}
-			return
 		}
-		go m.handleConn(client, local, ti.Port)
+
+		addr := fmt.Sprintf("127.0.0.1:%d", ti.Port.LocalPort)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			client.Close()
+			m.setStatus(ti, StatusError, fmt.Sprintf("listen %s: %v", addr, err))
+			select {
+			case <-ti.cancel:
+				m.setStatus(ti, StatusStopped, "")
+				return
+			case <-time.After(reconnectDelay):
+				continue
+			}
+		}
+
+		m.mu.Lock()
+		ti.listener = ln
+		m.mu.Unlock()
+
+		m.setStatus(ti, StatusActive, "")
+
+		// Keepalive goroutine: sends periodic pings to detect silent SSH drops.
+		// If the keepalive times out or errors we close the listener, which
+		// unblocks Accept and triggers a reconnect.
+		go func(c *ssh.Client, l net.Listener) {
+			ticker := time.NewTicker(keepaliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ti.cancel:
+					return
+				case <-ticker.C:
+					if err := sendKeepAliveWithTimeout(c, 10*time.Second); err != nil {
+						l.Close()
+						c.Close()
+						return
+					}
+				}
+			}
+		}(client, ln)
+
+		// Cancel watcher: closes this iteration's resources when stopped.
+		go func(c *ssh.Client, l net.Listener) {
+			<-ti.cancel
+			l.Close()
+			c.Close()
+		}(client, ln)
+
+		// Accept loop: runs until the listener is closed (by keepalive failure,
+		// cancel, or an external error).
+		for {
+			local, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ti.cancel:
+					m.setStatus(ti, StatusStopped, "")
+					return
+				default:
+					m.setStatus(ti, StatusError, "connection lost, reconnecting…")
+				}
+				break
+			}
+			go m.handleConn(client, local, ti.Port)
+		}
+
+		client.Close()
+		ln.Close()
+
+		// Wait before reconnecting, but respect cancellation.
+		select {
+		case <-ti.cancel:
+			m.setStatus(ti, StatusStopped, "")
+			return
+		case <-time.After(reconnectDelay):
+		}
 	}
 }
 
@@ -146,10 +214,18 @@ func (m *Manager) handleConn(client *ssh.Client, local net.Conn, port db.Port) {
 		return
 	}
 	defer remote.Close()
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(remote, local); done <- struct{}{} }()
-	go func() { io.Copy(local, remote); done <- struct{}{} }()
-	<-done
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(remote, local)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(local, remote)
+	}()
+	wg.Wait()
 }
 
 func (m *Manager) setStatus(ti *TunnelInfo, s Status, msg string) {
@@ -187,8 +263,39 @@ func dialSSH(server *db.Server) (*ssh.Client, error) {
 		User:            server.User,
 		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         dialTimeout,
 	}
 
-	addr := fmt.Sprintf("%s:%d", server.Host, server.SSHPort)
-	return ssh.Dial("tcp", addr, cfg)
+	addr := net.JoinHostPort(server.Host, fmt.Sprintf("%d", server.SSHPort))
+
+	// Dial TCP manually so we can enable OS-level TCP keepalive.
+	tcpConn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := tcpConn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(keepaliveInterval)
+	}
+
+	c, chans, reqs, err := ssh.NewClientConn(tcpConn, addr, cfg)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+func sendKeepAliveWithTimeout(client *ssh.Client, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("keepalive timeout")
+	}
 }

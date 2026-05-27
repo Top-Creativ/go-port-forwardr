@@ -109,7 +109,7 @@ func (m ServerListModel) View() string {
 	}
 
 	// Help
-	help := " enter:select  n:new  e:edit  d:delete  q:quit"
+	help := " enter:select  n:new  e:edit  d:delete  x:export  i:import  q:quit"
 	b.WriteString(StyleHelp.Render(help))
 
 	return b.String()
